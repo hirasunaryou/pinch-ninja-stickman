@@ -25,6 +25,7 @@ GAME_DURATION = 30             # Seconds per round
 WINDOW_NAME = "Pinch Ninja Stickman"
 # ====================================================================
 
+import importlib.util
 import math
 import random
 import time
@@ -149,6 +150,48 @@ def draw_hud(frame: np.ndarray, score: int, remaining: float, pinch_on: bool, pi
     cv2.putText(frame, f"FPS: {fps:05.2f}", (25, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2)
 
 
+def load_mediapipe_components() -> Tuple[object, object, object]:
+    """Load MediaPipe helper modules with helpful guidance for beginners.
+
+    A few Windows installations ship a broken `mediapipe` package that lacks the
+    `solutions` attribute, which leads to the cryptic error
+    `AttributeError: module 'mediapipe' has no attribute 'solutions'` at runtime.
+    To make that failure friendlier and more actionable, we:
+    - check whether the official `mediapipe.solutions` package can be located,
+    - exit early with a clear reinstall tip if the attribute is missing, and
+    - return the specific modules the rest of the game expects.
+
+    The import itself stays outside a try/except (per project style), so Python
+    will still surface an ImportError if the package is entirely unavailable.
+    """
+
+    # Early probe so we can give an explanatory message before the game loop.
+    has_solutions_attr = hasattr(mp, "solutions")
+    solutions_spec = importlib.util.find_spec("mediapipe.solutions")
+
+    if has_solutions_attr:
+        mp_solutions = mp.solutions
+    elif solutions_spec is not None:
+        # Fallback path when `mediapipe` imported but did not expose `.solutions`.
+        import mediapipe.solutions as mp_solutions  # noqa: WPS433 - intentional runtime import
+    else:
+        print(
+            "[Error] MediaPipe is installed but missing its 'solutions' helpers. "
+            "Please reinstall the official package with: pip install --upgrade mediapipe"
+        )
+        raise SystemExit(1)
+
+    missing = [name for name in ("hands", "drawing_utils", "drawing_styles") if not hasattr(mp_solutions, name)]
+    if missing:
+        print(
+            "[Error] Your MediaPipe install is incomplete (missing: "
+            f"{', '.join(missing)}). Try reinstalling with: pip install --upgrade mediapipe"
+        )
+        raise SystemExit(1)
+
+    return mp_solutions.hands, mp_solutions.drawing_utils, mp_solutions.drawing_styles
+
+
 def main() -> None:
     # Initialize camera
     cap = cv2.VideoCapture(0)
@@ -169,7 +212,9 @@ def main() -> None:
     # Create targets
     targets = create_targets(width, height)
 
-    mp_hands = mp.solutions.hands
+    # Load MediaPipe helpers with extra validation so beginners get friendlier errors.
+    mp_hands, mp_drawing, mp_styles = load_mediapipe_components()
+
     hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
     pinch_on = False
@@ -204,13 +249,13 @@ def main() -> None:
             pinch_distance = math.hypot(dx, dy)
             pinch_now = pinch_distance < PINCH_THRESHOLD
 
-            # Draw hand landmarks for learning/debugging.
-            mp.solutions.drawing_utils.draw_landmarks(
+            # Draw hand landmarks to help learners see the detection output live.
+            mp_drawing.draw_landmarks(
                 frame,
                 hand_landmarks,
                 mp_hands.HAND_CONNECTIONS,
-                landmark_drawing_spec=mp.solutions.drawing_styles.get_default_hand_landmarks_style(),
-                connection_drawing_spec=mp.solutions.drawing_styles.get_default_hand_connections_style(),
+                landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
+                connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
             )
 
         # Debounce logic: only switch states after consistent frames.
