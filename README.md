@@ -61,5 +61,16 @@ Open `pinch_ninja_stickman.py` and find the top section marked `EDIT HERE`. Thes
   python postcall_trace.py
   ```
 
+### Developer: browse log bundles visually / ログバンドルをUIで閲覧する
+- Launch the investigation UI and open `http://localhost:8000/dev/logs`  
+  調査用ビューアーを起動し、`http://localhost:8000/dev/logs` を開く:
+  ```bash
+  python dev_log_viewer.py --port 8000
+  ```
+- Filters: missingCount・durationMs・tokens・tag substring  
+  フィルター: missingCount・durationMs・tokens・タグ部分一致
+- Detail tabs include Request, Transcript, Evidence Map, Assets, and Diff between parsed vs final extraction traces.  
+  詳細画面は Request / Transcript / Evidence Map / Assets / Diff（パース結果と最終結果の差分）をタブで切り替えられます。
+
 ## Lessons / ミッション集
 See **LESSONS.md** for beginner-friendly missions you can try while playing. Screenshot ideas and small effects are included.
