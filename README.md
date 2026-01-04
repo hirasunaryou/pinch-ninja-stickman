@@ -51,5 +51,15 @@ Open `pinch_ninja_stickman.py` and find the top section marked `EDIT HERE`. Thes
   - Close other apps (Teams/Zoom/browser tabs) that might hold the webcam.  
   - Unplug/replug the webcam or switch to another camera index in `cv2.VideoCapture(0)` if needed.
 
+## Developer: postcall trace bundles / 開発者向けトレースバンドル
+- **EN:** The file `postcall_trace.py` writes a redacted debug bundle to `.dal_logs/postcall/runs/YYYYMMDD/<requestId>/` so you can trace how an LLM pipeline behaved without storing raw prompts or transcripts. Run it directly to generate a safe demo bundle:
+  ```bash
+  python postcall_trace.py
+  ```
+- **JP:** `postcall_trace.py` は `.dal_logs/postcall/runs/YYYYMMDD/<requestId>/` にマスク済みのトレースバンドルを出力します。生のプロンプトや会話を保存しない設計なので安心です。デモを作るには次を実行してください:
+  ```bash
+  python postcall_trace.py
+  ```
+
 ## Lessons / ミッション集
 See **LESSONS.md** for beginner-friendly missions you can try while playing. Screenshot ideas and small effects are included.
