@@ -30,6 +30,7 @@ import json
 import os
 import urllib.parse
 import zipfile
+from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +38,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Root where postcall_trace.py writes bundles. Kept configurable for tests.
 LOG_ROOT = Path(".dal_logs/postcall/runs")
+NOTES_PATH = LOG_ROOT.parent / "70_notes.md"
+PROBE_PLAN_QUEUE_PATH = LOG_ROOT.parent / "probe_plan_review_queue.jsonl"
+
+
+def _today_str() -> str:
+    """Date helper for naming notes or defaulting date buckets."""
+    return datetime.utcnow().strftime("%Y%m%d")
 
 
 def _read_json_if_exists(path: Path) -> Dict[str, Any]:
@@ -116,6 +124,16 @@ def _dev_bundle_download_enabled() -> bool:
     like the intended hosting environment.
     """
     return os.environ.get("NODE_ENV") == "development" and os.environ.get("DAL_LOG_UI") == "true"
+
+
+def _dev_mutation_enabled() -> bool:
+    """
+    Reuse the same dev-only guard for write endpoints (notes, review queue).
+
+    Keeping a single toggle mirrors the download protection above and makes the
+    expected environment contract easy to remember while hacking locally.
+    """
+    return _dev_bundle_download_enabled()
 
 
 def _token_count(meta: Dict[str, Any]) -> Optional[int]:
@@ -261,6 +279,122 @@ def _extract_assets(request_json: Dict[str, Any], final_output: Dict[str, Any]) 
     return {"assetHintsSummary": asset_hints, "linkedAssets": linked_assets}
 
 
+def _ensure_notes_file() -> List[str]:
+    """
+    Load the notes file (70_notes.md) as a mutable list of lines, creating it if
+    missing. Storing lines keeps the Markdown structure easy to tweak.
+    """
+    if not NOTES_PATH.exists():
+        NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NOTES_PATH.write_text("# Dev run annotations (70_notes.md)\n\n", encoding="utf-8")
+    return NOTES_PATH.read_text(encoding="utf-8").splitlines()
+
+
+def _append_note_for_request(request_id: str, note: str) -> Dict[str, str]:
+    """
+    Append a timestamped note under the requestId heading inside 70_notes.md.
+
+    The file stays Markdown so humans can read/edit it, while we keep the write
+    logic deterministic for the UI.
+    """
+    clean_note = " ".join(str(note).split())
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    entry_line = f"- {timestamp}: {clean_note}"
+    header_line = f"## {request_id}"
+
+    lines = _ensure_notes_file()
+
+    # Find or create the section for this requestId.
+    if header_line not in lines:
+        if lines and lines[-1].strip():
+            lines.append("")  # keep a blank line before new section
+        lines.extend([header_line, entry_line, ""])
+    else:
+        insert_at = lines.index(header_line) + 1
+        # Skip past any existing bullet lines within this section.
+        while insert_at < len(lines) and not lines[insert_at].startswith("## "):
+            insert_at += 1
+        lines.insert(insert_at, entry_line)
+
+    NOTES_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return {"timestamp": timestamp, "text": clean_note}
+
+
+def _read_notes() -> Dict[str, List[Dict[str, str]]]:
+    """
+    Parse 70_notes.md into a dict keyed by requestId.
+    """
+    if not NOTES_PATH.exists():
+        return {}
+    notes: Dict[str, List[Dict[str, str]]] = {}
+    current_request: Optional[str] = None
+    for raw_line in NOTES_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            current_request = line[3:].strip()
+            continue
+        if current_request and line.startswith("- "):
+            payload = line[2:]
+            if ": " in payload:
+                ts, text = payload.split(": ", 1)
+            else:
+                ts, text = "", payload
+            notes.setdefault(current_request, []).append({"timestamp": ts, "text": text})
+    return notes
+
+
+def _read_notes_for_request(request_id: str) -> List[Dict[str, str]]:
+    """Return stored notes for a specific requestId."""
+    all_notes = _read_notes()
+    return all_notes.get(request_id, [])
+
+
+def _enqueue_probe_plan(
+    *,
+    request_id: str,
+    date_bucket: str,
+    draft_text: str,
+    missing_fields: List[str],
+    follow_up_questions: List[str],
+    tags: List[str],
+) -> Dict[str, Any]:
+    """
+    Append a ProbePlan draft entry to a JSONL review queue for later triage.
+    """
+    PROBE_PLAN_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "requestId": request_id,
+        "dateBucket": date_bucket,
+        "draftText": draft_text,
+        "missingFields": missing_fields,
+        "followUpQuestions": follow_up_questions,
+        "tags": tags,
+        "createdAt": datetime.utcnow().isoformat() + "Z",
+        "kind": "probePlanDraft",
+    }
+    with PROBE_PLAN_QUEUE_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False))
+        handle.write("\n")
+    return entry
+
+
+def _load_probe_plans_for_request(request_id: str) -> List[Dict[str, Any]]:
+    """
+    Read any ProbePlan draft entries for this requestId from the review queue.
+    """
+    if not PROBE_PLAN_QUEUE_PATH.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    for line in PROBE_PLAN_QUEUE_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("requestId") == request_id:
+            entries.append(payload)
+    return entries
+
+
 def _load_run_detail(date_bucket: str, request_id: str) -> Dict[str, Any]:
     """
     Load all relevant files for a single bundle and derive UI-friendly slices.
@@ -305,6 +439,8 @@ def _load_run_detail(date_bucket: str, request_id: str) -> Dict[str, Any]:
         "missingCount": missing_count,
         "tokenCount": _token_count(response_meta),
         "tags": _extract_tags(request_json, index_json),
+        "notes": _read_notes_for_request(request_id),
+        "probePlanDrafts": _load_probe_plans_for_request(request_id),
     }
 
 
@@ -397,6 +533,11 @@ def _html_shell() -> str:
       .callout { padding:12px; background:#f0f4ff; border:1px solid #d3dffb; border-radius:10px; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; }
       .small { color:var(--muted); font-size:12px; }
+      textarea { width:100%; min-height:90px; padding:10px; border-radius:10px; border:1px solid #cbd4e3; resize:vertical; font-family:inherit; }
+      .stack { display:flex; flex-direction:column; gap:8px; }
+      .meta-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+      .pill-button.secondary { background:#16345c; }
+      .muted { color:var(--muted); }
     </style>
   </head>
   <body>
@@ -569,14 +710,223 @@ def _html_shell() -> str:
         `;
       }
 
+      function renderNoteHistory(notes) {
+        if (!notes?.length) return '<div class=\"small muted\">No saved notes for this request yet.</div>';
+        return notes
+          .map(
+            (note) => `
+              <div class=\"callout\" style=\"margin-bottom:6px;\">
+                <div class=\"small mono\">${note.timestamp || ''}</div>
+                <div>${note.text || ''}</div>
+              </div>
+            `
+          )
+          .join('');
+      }
+
+      function collectArray(payload, key) {
+        const values = [];
+        if (!payload || typeof payload !== 'object') return values;
+        if (Array.isArray(payload[key])) values.push(...payload[key]);
+        if (payload.finalOutput && Array.isArray(payload.finalOutput[key])) values.push(...payload.finalOutput[key]);
+        return values;
+      }
+
+      function extractProbePlanInputs(data) {
+        const sources = [data.finalOutput, data.traceFinal, data.parsedOutput];
+        const missingFields = [];
+        const followUpQuestions = [];
+        sources.forEach((payload) => {
+          missingFields.push(...collectArray(payload, 'missingFields'));
+          followUpQuestions.push(...collectArray(payload, 'followUpQuestions'));
+        });
+        const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean).map((item) => String(item))));
+        return { missingFields: dedupe(missingFields), followUpQuestions: dedupe(followUpQuestions) };
+      }
+
+      function buildProbePlanDraft(data) {
+        const { missingFields, followUpQuestions } = extractProbePlanInputs(data);
+        const generatedAt = new Date().toISOString();
+        const lines = [
+          `# ProbePlan draft for ${data.requestId}`,
+          `- generatedAt: ${generatedAt}`,
+          `- missingCount: ${data.missingCount ?? 0}`,
+          '',
+          '## missingFields',
+          ...(missingFields.length ? missingFields.map((field) => `- ${field}`) : ['- (none detected)']),
+          '',
+          '## followUpQuestions',
+          ...(followUpQuestions.length ? followUpQuestions.map((q) => `- ${q}`) : ['- (none detected)']),
+          '',
+          '## probe actions',
+          '- Draft probes to close the gaps above (turn snippets into concrete asks).',
+          '- Link findings back to this requestId when promoting to assets.',
+        ];
+        return { draftText: lines.join('\\n'), missingFields, followUpQuestions, generatedAt };
+      }
+
+      function loadLocalProbePlan(requestId) {
+        const raw = localStorage.getItem(`probePlanDraft:${requestId}`);
+        if (!raw) return null;
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return null;
+        }
+      }
+
+      function persistLocalProbePlan(requestId, draft) {
+        localStorage.setItem(`probePlanDraft:${requestId}`, JSON.stringify(draft));
+      }
+
+      function renderProbePreview(draft) {
+        if (!draft) return '<div class=\"small muted\">No ProbePlan draft yet. Click “ProbePlan下書きを作る”.</div>';
+        const summary = draft.draftText || '';
+        return `<pre class=\"mono\" style=\"max-height:220px; overflow:auto; white-space:pre-wrap;\">${summary.replace(/</g, '&lt;')}</pre>`;
+      }
+
+      function bindNotes(root, data, requestId) {
+        const noteInput = root.querySelector('#note-input');
+        const noteStatus = root.querySelector('#note-status');
+        const noteHistory = root.querySelector('#note-history');
+        const noteButton = root.querySelector('#save-note');
+        if (!noteInput || !noteStatus || !noteHistory || !noteButton) return;
+
+        const draftKey = `noteDraft:${requestId}`;
+        const cachedDraft = localStorage.getItem(draftKey);
+        if (cachedDraft) noteInput.value = cachedDraft;
+
+        noteHistory.innerHTML = renderNoteHistory(data.notes);
+
+        noteInput.addEventListener('input', () => {
+          localStorage.setItem(draftKey, noteInput.value);
+        });
+
+        noteButton.addEventListener('click', async () => {
+          const note = noteInput.value.trim();
+          if (!note) {
+            noteStatus.textContent = 'Enter a note before saving.';
+            return;
+          }
+          noteButton.disabled = true;
+          noteStatus.textContent = 'Saving to 70_notes.md...';
+          try {
+            const res = await fetch('/dev/logs/api/note', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requestId, note }),
+            });
+            if (!res.ok) throw new Error('save failed');
+            const payload = await res.json();
+            noteHistory.innerHTML = renderNoteHistory(payload.notes);
+            noteStatus.textContent = 'Saved to 70_notes.md (dev-only).';
+            localStorage.removeItem(draftKey);
+            noteInput.value = '';
+          } catch (error) {
+            noteStatus.textContent = 'Save failed. Ensure NODE_ENV=development and DAL_LOG_UI=true.';
+          } finally {
+            noteButton.disabled = false;
+          }
+        });
+      }
+
+      function bindProbePlan(root, data, requestId, dateBucket) {
+        const preview = root.querySelector('#probe-plan-preview');
+        const status = root.querySelector('#probe-plan-status');
+        const buildBtn = root.querySelector('#probe-plan-btn');
+        const saveBtn = root.querySelector('#save-probe-plan');
+
+        const serverDrafts = Array.isArray(data.probePlanDrafts) ? data.probePlanDrafts : [];
+        const latestServer = serverDrafts[serverDrafts.length - 1] || null;
+        const initialDraft = loadLocalProbePlan(requestId) || latestServer;
+
+        if (preview) {
+          preview.innerHTML = renderProbePreview(initialDraft);
+        }
+
+        const buildDraft = () => {
+          const draft = buildProbePlanDraft(data);
+          persistLocalProbePlan(requestId, draft);
+          if (preview) preview.innerHTML = renderProbePreview(draft);
+          if (status) status.textContent = 'Draft updated locally from missingFields + followUpQuestions.';
+          return draft;
+        };
+
+        if (buildBtn) {
+          buildBtn.addEventListener('click', () => {
+            buildDraft();
+          });
+        }
+
+        if (saveBtn) {
+          saveBtn.addEventListener('click', async () => {
+            const draft = loadLocalProbePlan(requestId) || buildDraft();
+            saveBtn.disabled = true;
+            if (status) status.textContent = 'Queueing draft to review...';
+            try {
+              const res = await fetch('/dev/logs/api/probe-plan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId,
+                  dateBucket,
+                  draftText: draft.draftText,
+                  missingFields: draft.missingFields,
+                  followUpQuestions: draft.followUpQuestions,
+                  tags: data.tags || [],
+                }),
+              });
+              if (!res.ok) throw new Error('queue failed');
+              const payload = await res.json();
+              if (payload.queued) {
+                persistLocalProbePlan(requestId, payload.queued);
+                if (preview) preview.innerHTML = renderProbePreview(payload.queued);
+              }
+              if (status) status.textContent = 'Queued for review and saved locally.';
+            } catch (error) {
+              if (status) status.textContent = 'Queue failed. Dev-only endpoint requires NODE_ENV=development + DAL_LOG_UI=true.';
+            } finally {
+              saveBtn.disabled = false;
+            }
+          });
+        }
+      }
+
       function renderMeta(data) {
+        const probeDrafts = Array.isArray(data.probePlanDrafts) ? data.probePlanDrafts : [];
+        const latestServerDraft = probeDrafts[probeDrafts.length - 1] || null;
         return `
-          <div style=\"display:flex; align-items:center; gap:12px; flex-wrap:wrap;\">
-            <div>
-              <div><strong>${data.requestId}</strong> • ${data.index.schemaVersion || ''}</div>
-              <div class=\"small mono\">${data.dateBucket} / missingCount=${data.missingCount} / tokens=${data.tokenCount ?? 'n/a'}</div>
+          <div class=\"stack\">
+            <div style=\"display:flex; align-items:center; gap:12px; flex-wrap:wrap;\">
+              <div>
+                <div><strong>${data.requestId}</strong> • ${data.index.schemaVersion || ''}</div>
+                <div class=\"small mono\">${data.dateBucket} / missingCount=${data.missingCount} / tokens=${data.tokenCount ?? 'n/a'}</div>
+              </div>
+              <div class=\"meta-actions\">
+                <button id=\"download-bundle\" class=\"pill-button\">Download bundle</button>
+                <button id=\"probe-plan-btn\" class=\"pill-button secondary\">ProbePlan下書きを作る</button>
+              </div>
             </div>
-            <button id=\"download-bundle\" class=\"pill-button\">Download bundle</button>
+            <div class=\"grid\">
+              <div class=\"callout stack\">
+                <div><strong>Annotations</strong> (70_notes.md / dev-only)</div>
+                <textarea id=\"note-input\" placeholder=\"Write a quick insight, asset idea, or follow-up for this run.\"></textarea>
+                <div class=\"meta-actions\">
+                  <button id=\"save-note\" class=\"pill-button\">Save note</button>
+                  <span id=\"note-status\" class=\"small muted\"></span>
+                </div>
+                <div id=\"note-history\">${renderNoteHistory(data.notes)}</div>
+              </div>
+              <div class=\"callout stack\">
+                <div><strong>ProbePlan draft</strong> (missingFields + followUpQuestions)</div>
+                <div id=\"probe-plan-preview\">${renderProbePreview(latestServerDraft || loadLocalProbePlan(data.requestId))}</div>
+                <div class=\"meta-actions\">
+                  <button id=\"save-probe-plan\" class=\"pill-button\">Queue to review</button>
+                  <span id=\"probe-plan-status\" class=\"small muted\"></span>
+                </div>
+                <div class=\"small muted\">Drafts are cached locally and appended to the review queue when saved.</div>
+              </div>
+            </div>
           </div>
         `;
       }
@@ -652,6 +1002,9 @@ def _html_shell() -> str:
             }
           });
         }
+
+        bindNotes(detail, data, requestId);
+        bindProbePlan(detail, data, requestId, dateBucket);
       }
 
       async function boot() {
@@ -756,6 +1109,83 @@ class DevLogViewerHandler(SimpleHTTPRequestHandler):
 
         # Fallback to default behavior (e.g., serve files if needed).
         super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/dev/logs/api/note":
+            if not _dev_mutation_enabled():
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+
+            content_length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON body"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            request_id = payload.get("requestId")
+            note_text = payload.get("note")
+            if not request_id or not isinstance(request_id, str):
+                self._send_json({"error": "requestId is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not note_text or not isinstance(note_text, str):
+                self._send_json({"error": "note is required"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            note_entry = _append_note_for_request(request_id, note_text)
+            notes = _read_notes_for_request(request_id)
+            self._send_json({"saved": note_entry, "notes": notes})
+            return
+
+        if path == "/dev/logs/api/probe-plan":
+            if not _dev_mutation_enabled():
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+
+            content_length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON body"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            request_id = payload.get("requestId")
+            date_bucket = payload.get("dateBucket") or _today_str()
+            draft_text = payload.get("draftText") or ""
+            missing_fields = payload.get("missingFields") or []
+            follow_up_questions = payload.get("followUpQuestions") or []
+            tags = payload.get("tags") or []
+
+            if not request_id or not isinstance(request_id, str):
+                self._send_json({"error": "requestId is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(draft_text, str) or not draft_text.strip():
+                self._send_json({"error": "draftText is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(missing_fields, list) or not isinstance(follow_up_questions, list):
+                self._send_json({"error": "missingFields and followUpQuestions must be lists"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(tags, list):
+                self._send_json({"error": "tags must be a list"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            entry = _enqueue_probe_plan(
+                request_id=request_id,
+                date_bucket=str(date_bucket),
+                draft_text=draft_text,
+                missing_fields=[str(item) for item in missing_fields],
+                follow_up_questions=[str(item) for item in follow_up_questions],
+                tags=[str(item) for item in tags],
+            )
+            self._send_json({"queued": entry, "existing": _load_probe_plans_for_request(request_id)})
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
 
 def main() -> None:
