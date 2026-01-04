@@ -25,10 +25,11 @@ Why plain http.server instead of a heavier framework?
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import os
 import urllib.parse
-from dataclasses import dataclass
-from datetime import datetime
+import zipfile
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -73,6 +74,48 @@ def _gather_bundle_paths() -> List[Tuple[str, Path]]:
             if request_dir.is_dir():
                 bundles.append((date_bucket.name, request_dir))
     return bundles
+
+
+def _find_bundle_by_request_id(request_id: str) -> Optional[Tuple[str, Path]]:
+    """
+    Locate a bundle by request id across all date buckets.
+
+    The search is intentionally linear because bundle counts stay small in the
+    dev-only viewer. Keeping it simple avoids extra indexes while still being
+    easy to read and extend for future contributors.
+    """
+    for date_bucket, run_path in _gather_bundle_paths():
+        if run_path.name == request_id:
+            return date_bucket, run_path
+    return None
+
+
+def _zip_bundle(path: Path) -> bytes:
+    """
+    Create an in-memory ZIP archive of a bundle directory.
+
+    Using BytesIO keeps the endpoint dependency-free while still letting the UI
+    stream a file download response.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in path.rglob("*"):
+            if file_path.is_file():
+                arcname = file_path.relative_to(path.parent)
+                # Educational comment: arcname preserves the requestId folder so
+                # the unzip path stays clear to the reader.
+                zf.write(file_path, arcname)
+    return buffer.getvalue()
+
+
+def _dev_bundle_download_enabled() -> bool:
+    """
+    Gate bundle downloads behind explicit dev flags.
+
+    We mirror the Node-style environment contract so the Python viewer behaves
+    like the intended hosting environment.
+    """
+    return os.environ.get("NODE_ENV") == "development" and os.environ.get("DAL_LOG_UI") == "true"
 
 
 def _token_count(meta: Dict[str, Any]) -> Optional[int]:
@@ -338,6 +381,8 @@ def _html_shell() -> str:
       th, td { text-align:left; padding:8px; border-bottom:1px solid #e3e7ef; }
       th { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:0.02em; }
       .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; background:#e8f0ff; color:#0b2340; border-radius:999px; font-size:12px; }
+      .pill-button { display:inline-flex; align-items:center; gap:6px; padding:8px 12px; background:#0f6ad8; color:#fff; border:none; border-radius:10px; font-weight:600; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+      .pill-button:disabled { background:#9bb8e8; cursor:not-allowed; }
       .tabs { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
       .tab { padding:10px 14px; border:1px solid #d0d7e5; border-radius:10px; background:#fff; cursor:pointer; }
       .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -526,8 +571,13 @@ def _html_shell() -> str:
 
       function renderMeta(data) {
         return `
-          <div><strong>${data.requestId}</strong> • ${data.index.schemaVersion || ''}</div>
-          <div class=\"small mono\">${data.dateBucket} / missingCount=${data.missingCount} / tokens=${data.tokenCount ?? 'n/a'}</div>
+          <div style=\"display:flex; align-items:center; gap:12px; flex-wrap:wrap;\">
+            <div>
+              <div><strong>${data.requestId}</strong> • ${data.index.schemaVersion || ''}</div>
+              <div class=\"small mono\">${data.dateBucket} / missingCount=${data.missingCount} / tokens=${data.tokenCount ?? 'n/a'}</div>
+            </div>
+            <button id=\"download-bundle\" class=\"pill-button\">Download bundle</button>
+          </div>
         `;
       }
 
@@ -576,6 +626,32 @@ def _html_shell() -> str:
 
         app.innerHTML = '';
         app.appendChild(detail);
+
+        const downloadButton = detail.querySelector('#download-bundle');
+        if (downloadButton) {
+          downloadButton.addEventListener('click', async () => {
+            downloadButton.disabled = true;
+            try {
+              const response = await fetch(`/api/dev/trace-bundle/download?requestId=${encodeURIComponent(requestId)}`);
+              if (!response.ok) {
+                throw new Error('Download failed');
+              }
+              const blob = await response.blob();
+              const url = URL.createObjectURL(blob);
+              const link = document.createElement('a');
+              link.href = url;
+              link.download = `${requestId}.zip`;
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+              URL.revokeObjectURL(url);
+            } catch (error) {
+              alert('Download unavailable (dev-only or bundle missing).');
+            } finally {
+              downloadButton.disabled = false;
+            }
+          });
+        }
       }
 
       async function boot() {
@@ -622,6 +698,34 @@ class DevLogViewerHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if path.startswith("/api/dev/trace-bundle/download"):
+            if not _dev_bundle_download_enabled():
+                # Return a soft 404 to avoid exposing the endpoint outside dev.
+                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+                return
+
+            params = urllib.parse.parse_qs(parsed.query)
+            request_id_values = params.get("requestId")
+            if not request_id_values or not request_id_values[0]:
+                self._send_json({"error": "requestId is required"}, HTTPStatus.BAD_REQUEST)
+                return
+
+            request_id = request_id_values[0]
+            bundle = _find_bundle_by_request_id(request_id)
+            if not bundle:
+                self._send_json({"error": "bundle not found"}, HTTPStatus.NOT_FOUND)
+                return
+
+            _, bundle_path = bundle
+            payload = _zip_bundle(bundle_path)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{request_id}.zip"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         if path.startswith("/dev/logs/api/runs"):
             runs = _build_runs_inventory()
