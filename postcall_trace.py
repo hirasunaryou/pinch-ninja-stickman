@@ -33,7 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 def _sha256_hex(value: str) -> str:
@@ -64,6 +64,179 @@ def _ensure_redacted_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, 
                 copy[key] = "[REDACTED]"
         redacted_messages.append(copy)
     return redacted_messages
+
+
+def _redact_preview(text: Optional[str], *, limit: int = 120) -> str:
+    """
+    Return a short, redacted-friendly preview of ``text``.
+
+    The goal is to avoid writing large payloads or multiline strings into the
+    sanitize report while still giving operators enough context to understand
+    what matched. We also keep the helper small and dependency-free so it stays
+    safe to use inside trace generation.
+    """
+
+    if not text:
+        return ""
+
+    # Collapse whitespace so previews read cleanly in the UI.
+    squished = " ".join(str(text).split())
+    if len(squished) <= limit:
+        return squished
+    return f"{squished[: limit - 3]}..."
+
+
+ReasonCode = Literal["invalid_turnIndex", "snippet_not_found", "value_not_found", "ok", "offset_fixed"]
+MatchedBy = Literal["snippet", "value", "none"]
+
+
+def _extract_turn_text(turn: Any) -> str:
+    """
+    Normalize different turn payload shapes to a plain text string.
+
+    The sanitizer is intentionally defensive because upstream call sites may
+    evolve. We check common keys but never raise on unexpected input so bundle
+    creation continues gracefully.
+    """
+    if isinstance(turn, str):
+        return turn
+
+    if isinstance(turn, dict):
+        for key in ("text", "content", "turnText", "message"):
+            candidate = turn.get(key)
+            if isinstance(candidate, str):
+                return candidate
+
+    return ""
+
+
+def _extract_turns(trace: Dict[str, Any]) -> List[str]:
+    """
+    Pull turn texts from likely keys while avoiding KeyError surprises.
+
+    The helper covers a few naming conventions so callers do not have to
+    pre-normalize conversation turns before producing a sanitize report.
+    """
+    for key in ("turns", "conversation", "conversationTurns", "turnTexts"):
+        turns = trace.get(key)
+        if isinstance(turns, list):
+            return [_extract_turn_text(turn) for turn in turns]
+    return []
+
+
+def sanitizeExtractionTrace(extraction_trace: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Sanitize an extraction trace and produce a reason-rich report.
+
+    Returns a tuple of:
+    1) sanitized trace with any offset fixes applied, and
+    2) per-field reasons that explain how each value/snippet was matched.
+    """
+
+    turns = _extract_turns(extraction_trace)
+    per_field_raw = extraction_trace.get("perField") or extraction_trace.get("fields") or []
+
+    sanitized_fields: List[Dict[str, Any]] = []
+    per_field_report: List[Dict[str, Any]] = []
+    invalid_evidence_count = 0
+    fixed_offset_count = 0
+
+    for field in per_field_raw:
+        field_copy = dict(field)  # Avoid mutating caller data.
+        turn_index = field.get("turnIndex")
+        turn_text = None
+
+        if isinstance(turn_index, int) and 0 <= turn_index < len(turns):
+            turn_text = turns[turn_index]
+        else:
+            invalid_evidence_count += 1
+
+        requested_snippet = field.get("requestedSnippet") or field.get("snippet") or field.get("evidence")
+        value = field.get("value")
+        start_char = field.get("startChar")
+        end_char = field.get("endChar")
+
+        matched_by: MatchedBy = "none"
+        reason: ReasonCode = "ok"
+
+        # Offsets: clamp to safe ranges so downstream readers never fail on out-of-range slicing.
+        if turn_text is not None and (isinstance(start_char, int) or isinstance(end_char, int)):
+            text_len = len(turn_text)
+            start = start_char if isinstance(start_char, int) else 0
+            end = end_char if isinstance(end_char, int) else text_len
+            fixed_start = max(0, min(start, text_len))
+            fixed_end = max(fixed_start, min(end, text_len))
+            if fixed_start != start or fixed_end != end:
+                fixed_offset_count += 1
+                reason = "offset_fixed"
+            field_copy["startChar"] = fixed_start
+            field_copy["endChar"] = fixed_end
+
+        if turn_text is None:
+            reason = "invalid_turnIndex"
+        else:
+            snippet_found = bool(requested_snippet) and requested_snippet in turn_text
+            value_found = bool(value) and str(value) in turn_text
+
+            if snippet_found:
+                matched_by = "snippet"
+                # Keep the stronger offset_fixed reason if it was already set.
+                reason = reason if reason == "offset_fixed" else "ok"
+            elif requested_snippet:
+                reason = "offset_fixed" if reason == "offset_fixed" else "snippet_not_found"
+                matched_by = "value" if value_found else "none"
+            elif value_found:
+                matched_by = "value"
+                reason = reason if reason == "offset_fixed" else "ok"
+            else:
+                matched_by = "none"
+                reason = reason if reason == "offset_fixed" else "value_not_found"
+
+        per_field_report.append(
+            {
+                "field": field.get("field") or field.get("name") or field.get("path") or "",
+                "turnIndex": turn_index,
+                "reason": reason,
+                "matchedBy": matched_by,
+                "turnTextPreview": _redact_preview(turn_text),
+                "snippetPreview": _redact_preview(requested_snippet),
+                "valuePreview": _redact_preview(value),
+            }
+        )
+        sanitized_fields.append(field_copy)
+
+    sanitized_trace = {"turns": [{"text": text} for text in turns], "perField": sanitized_fields}
+    sanitize_report = {
+        "invalidEvidenceCount": invalid_evidence_count,
+        "fixedOffsetCount": fixed_offset_count,
+        "perField": per_field_report,
+    }
+    return sanitized_trace, sanitize_report
+
+
+def format_sanitize_report(report: Dict[str, Any]) -> str:
+    """
+    Render a compact, human-friendly sanitize report for console/UI display.
+    """
+    lines = [
+        f"invalidEvidenceCount: {report.get('invalidEvidenceCount', 0)}",
+        f"fixedOffsetCount: {report.get('fixedOffsetCount', 0)}",
+    ]
+
+    for field in report.get("perField", []):
+        header = (
+            f"- field='{field.get('field', '')}' turnIndex={field.get('turnIndex')} "
+            f"reason={field.get('reason')} matchedBy={field.get('matchedBy')}"
+        )
+        lines.append(header)
+        if field.get("turnTextPreview"):
+            lines.append(f"  turnTextPreview: {field['turnTextPreview']}")
+        if field.get("snippetPreview"):
+            lines.append(f"  snippetPreview: {field['snippetPreview']}")
+        if field.get("valuePreview"):
+            lines.append(f"  valuePreview: {field['valuePreview']}")
+
+    return "\n".join(lines)
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -269,8 +442,57 @@ class PostcallTraceLogger:
 if __name__ == "__main__":
     # Quick demo showing how to write a fully redacted bundle with placeholder
     # values. Running this module directly will create a safe sample bundle that
-    # contains no user data.
+    # contains no user data. We also print the sanitize report so developers can
+    # see the new reason codes rendered in a compact UI.
     logger = PostcallTraceLogger(prompt_version="demo-v1", schema_version="2024-07-01")
+
+    # Simple toy extraction trace that demonstrates each reason code.
+    demo_extraction_trace = {
+        "turns": [
+            {"text": "[REDACTED] Patient visited North Hospital on 2024-07-03."},
+            {"text": "[REDACTED] Follow-up scheduled with Dr. Smith next week."},
+        ],
+        "perField": [
+            {  # clean match via snippet
+                "field": "hospital",
+                "turnIndex": 0,
+                "requestedSnippet": "North Hospital",
+                "value": "North Hospital",
+                "startChar": 25,
+                "endChar": 39,
+            },
+            {  # missing snippet, but value matches
+                "field": "doctor",
+                "turnIndex": 1,
+                "value": "Dr. Smith",
+                "startChar": 33,
+                "endChar": 42,
+            },
+            {  # invalid turn index
+                "field": "admissionDate",
+                "turnIndex": 5,
+                "requestedSnippet": "2024-07-03",
+                "value": "2024-07-03",
+            },
+            {  # offset fix example
+                "field": "followup_note",
+                "turnIndex": 1,
+                "requestedSnippet": "next week",
+                "startChar": -5,
+                "endChar": 400,
+            },
+            {  # value not found example
+                "field": "department",
+                "turnIndex": 0,
+                "value": "Cardiology",
+            },
+        ],
+    }
+
+    sanitized_trace, sanitize_report = sanitizeExtractionTrace(demo_extraction_trace)
+    print("Sanitize report (demo):\n-----------------------")
+    print(format_sanitize_report(sanitize_report))
+
     logger.write_bundle(
         request_id="demo-request",
         raw_prompt_text="safe demo prompt for hashing only",
@@ -281,9 +503,9 @@ if __name__ == "__main__":
         system_prompt_redacted="You are a helpful assistant (demo).",
         openai_request_redacted={"model": "gpt-4o-mini", "response_format": {"name": "json_object"}},
         openai_response_meta={"id": "response-123", "model": "gpt-4o-mini", "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
-        trace_raw={"input": "placeholder raw trace"},
-        trace_sanitized={"input": "placeholder sanitized trace"},
-        trace_final={"output": "placeholder final trace"},
-        sanitize_reasons={"input": {"reason": "demo_only"}},
+        trace_raw={"extractionTrace": demo_extraction_trace},
+        trace_sanitized={"extractionTrace": sanitized_trace},
+        trace_final={"extractionTrace": sanitized_trace},
+        sanitize_reasons=sanitize_report,
         response_format_name="json_object",
     )
